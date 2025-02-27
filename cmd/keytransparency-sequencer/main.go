@@ -16,31 +16,31 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"time"
 
 	"github.com/golang/glog"
-	"github.com/golang/protobuf/proto" //nolint:staticcheck
+	"github.com/golang/protobuf/proto"
 	"github.com/google/trillian"
 	"github.com/google/trillian/crypto/keys/der"
 	"github.com/google/trillian/crypto/keyspb"
 	"github.com/google/trillian/monitoring/prometheus"
 	"github.com/google/trillian/util/election2"
 	"github.com/google/trillian/util/etcd"
-	"gocloud.dev/server"
-	"gocloud.dev/server/health"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/reflection"
 
-	"github.com/google/keytransparency/cmd/serverutil"
 	"github.com/google/keytransparency/core/adminserver"
 	"github.com/google/keytransparency/core/sequencer"
 	"github.com/google/keytransparency/core/sequencer/election"
-	"github.com/google/keytransparency/impl"
-	"github.com/google/keytransparency/internal/forcemaster"
+	"github.com/google/keytransparency/impl/sql/directory"
+	"github.com/google/keytransparency/impl/sql/engine"
+	"github.com/google/keytransparency/impl/sql/mutationstorage"
 
 	pb "github.com/google/keytransparency/core/api/v1/keytransparency_go_proto"
 	dir "github.com/google/keytransparency/core/directory"
@@ -56,30 +56,40 @@ import (
 var (
 	keyFile     = flag.String("tls-key", "genfiles/server.key", "TLS private key file")
 	certFile    = flag.String("tls-cert", "genfiles/server.crt", "TLS cert file")
-	addr        = flag.String("addr", ":8080", "The ip:port to serve on")
+	listenAddr  = flag.String("addr", ":8080", "The ip:port to serve on")
 	metricsAddr = flag.String("metrics-addr", ":8081", "The ip:port to publish metrics on")
 
 	forceMaster = flag.Bool("force_master", false, "If true, assume master for all directories")
 	etcdServers = flag.String("etcd_servers", "", "A comma-separated list of etcd servers; no etcd registration if empty")
 	lockDir     = flag.String("lock_file_path", "/keytransparency/master", "etcd lock file directory path")
 
-	dbPath   = flag.String("db", "", "Database connection string")
-	dbEngine = flag.String("db_engine", "mysql", fmt.Sprintf("Storage engines: %v", impl.StorageEngines()))
+	serverDBPath = flag.String("db", "db", "Database connection string")
+
 	// Info to connect to the trillian map and log.
 	mapURL = flag.String("map-url", "", "URL of Trillian Map Server")
 	logURL = flag.String("log-url", "", "URL of Trillian Log Server for Signed Map Heads")
 
-	dirRefresh = flag.Duration("directory-refresh", 5*time.Second, "Time to detect new directory")
-	refresh    = flag.Duration("refresh", 5*time.Second, "Time between map revision construction runs")
-	batchSize  = flag.Int("batch-size", 100, "Maximum number of mutations to process per map revision")
+	refresh   = flag.Duration("directory-refresh", 5*time.Second, "Time to detect new directory")
+	batchSize = flag.Int("batch-size", 100, "Maximum number of mutations to process per map revision")
 )
+
+func openDB() *sql.DB {
+	db, err := sql.Open(engine.DriverName, *serverDBPath)
+	if err != nil {
+		glog.Exitf("sql.Open(): %v", err)
+	}
+	if err := db.Ping(); err != nil {
+		glog.Exitf("db.Ping(): %v", err)
+	}
+	return db
+}
 
 // getElectionFactory returns an election factory based on flags, and a
 // function which releases the resources associated with the factory.
 func getElectionFactory() (election2.Factory, func()) {
 	if *forceMaster {
 		glog.Warning("Acting as master for all directories")
-		return forcemaster.Factory{}, func() {}
+		return election2.NoopFactory{}, func() {}
 	}
 	if len(*etcdServers) == 0 {
 		glog.Exit("Either --force_master or --etcd_servers must be supplied")
@@ -119,11 +129,17 @@ func main() {
 	}
 
 	// Database tables
-	db, err := impl.NewStorage(ctx, *dbEngine, *dbPath)
+	sqldb := openDB()
+	defer sqldb.Close()
+
+	mutations, err := mutationstorage.New(sqldb)
 	if err != nil {
-		glog.Exit(err)
+		glog.Exitf("Failed to create mutations object: %v", err)
 	}
-	defer db.Close()
+	directoryStorage, err := directory.NewStorage(sqldb)
+	if err != nil {
+		glog.Exitf("Failed to create directory storage object: %v", err)
+	}
 
 	grpcServer := grpc.NewServer(
 		grpc.StreamInterceptor(grpc_prometheus.StreamServerInterceptor),
@@ -131,19 +147,29 @@ func main() {
 	)
 
 	// Listen and create empty grpc client connection.
-	lis, conn, done, err := serverutil.ListenTLS(ctx, *addr, *certFile, *keyFile)
+	lis, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
-		glog.Fatalf("Listen(%v): %v", *addr, err)
+		glog.Exitf("error creating TCP listener: %v", err)
 	}
-	defer done()
+	glog.Infof("Listening on %v", lis.Addr().String())
+	// Non-blocking dial before we start the server.
+	tcreds, err := credentials.NewClientTLSFromFile(*certFile, "localhost")
+	if err != nil {
+		glog.Exitf("Failed opening cert file %v: %v", *certFile, err)
+	}
+	dopts := []grpc.DialOption{grpc.WithTransportCredentials(tcreds)}
+	addr := lis.Addr().String()
+	conn, err := grpc.DialContext(ctx, addr, dopts...)
+	if err != nil {
+		glog.Exitf("error connecting to %v: %v", addr, err)
+	}
+	defer conn.Close()
 
 	spb.RegisterKeyTransparencySequencerServer(grpcServer, sequencer.NewServer(
-		db.Directories,
+		directoryStorage,
 		trillian.NewTrillianLogClient(lconn),
 		trillian.NewTrillianMapClient(mconn),
-		trillian.NewTrillianMapWriteClient(mconn),
-		db.Batches,
-		db.Logs,
+		mutations, mutations,
 		spb.NewKeyTransparencySequencerClient(conn),
 		prometheus.MetricFactory{}))
 
@@ -152,9 +178,8 @@ func main() {
 		trillian.NewTrillianMapClient(mconn),
 		trillian.NewTrillianAdminClient(lconn),
 		trillian.NewTrillianAdminClient(mconn),
-		db.Directories,
-		db.Logs,
-		db.Batches,
+		directoryStorage,
+		mutations,
 		func(ctx context.Context, spec *keyspb.Specification) (proto.Message, error) {
 			return der.NewProtoFromSpec(spec)
 		}))
@@ -163,26 +188,21 @@ func main() {
 	grpc_prometheus.Register(grpcServer)
 	grpc_prometheus.EnableHandlingTimeHistogram()
 
-	metricsSvr := serverutil.MetricsServer(*metricsAddr, &server.Options{
-		HealthChecks: []health.Checker{db.HealthChecker},
-	})
-	grpcGatewaySvr, nil := serverutil.GRPCGatewayServer(ctx, grpcServer, conn,
-		pb.RegisterKeyTransparencyAdminHandler)
-	if err != nil {
-		glog.Fatalf("GrpcGatewayServer(): %v", err)
-	}
+	glog.Infof("Signer starting")
 
-	g, gctx := errgroup.WithContext(ctx)
-	g.Go(func() error { return metricsSvr.ListenAndServe(*metricsAddr) })
-	g.Go(func() error { return grpcGatewaySvr.Serve(lis) })
-	go serverutil.ListenForCtrlC(metricsSvr, grpcGatewaySvr)
-	go runSequencer(gctx, conn, db.Directories)
+	// Run servers
+	go serveHTTPMetric(*metricsAddr)
+	go serveHTTPGateway(ctx, lis, dopts, grpcServer,
+		pb.RegisterKeyTransparencyAdminHandlerFromEndpoint,
+	)
+	runSequencer(ctx, conn, directoryStorage)
 
-	glog.Errorf("Sequencer exiting: %v", g.Wait())
+	// Shutdown.
+	glog.Errorf("Signer exiting")
 }
 
-func runSequencer(ctx context.Context, conn *grpc.ClientConn, directoryStorage dir.Storage) {
-	glog.Infof("Sequencer starting")
+func runSequencer(ctx context.Context, conn *grpc.ClientConn,
+	directoryStorage dir.Storage) {
 	electionFactory, closeFactory := getElectionFactory()
 	defer closeFactory()
 	signer := sequencer.New(
@@ -194,43 +214,18 @@ func runSequencer(ctx context.Context, conn *grpc.ClientConn, directoryStorage d
 	go signer.TrackMasterships(ctx)
 
 	go sequencer.PeriodicallyRun(ctx, time.Tick(*refresh), func(ctx context.Context) {
-		if err := signer.ForAllMasterships(ctx, func(ctx context.Context, dirID string) error {
-			_, err := spb.NewKeyTransparencySequencerClient(conn).
-				EstimateBacklog(ctx, &spb.EstimateBacklogRequest{
-					DirectoryId:       dirID,
-					MaxUnappliedCount: 100000,
-				})
-			return err
-		}); err != nil {
+		if _, err := spb.NewKeyTransparencySequencerClient(conn).
+			UpdateMetrics(ctx, &spb.UpdateMetricsRequest{}); err != nil {
 			glog.Errorf("UpdateMetrics(): %v", err)
 		}
 	})
 
-	if err := signer.AddAllDirectories(ctx); err != nil {
-		glog.Errorf("runSequencer(AddAllDirectories): %v", err)
-	}
-	go sequencer.PeriodicallyRun(ctx, time.Tick(*dirRefresh), func(ctx context.Context) {
+	sequencer.PeriodicallyRun(ctx, time.Tick(*refresh), func(ctx context.Context) {
 		if err := signer.AddAllDirectories(ctx); err != nil {
 			glog.Errorf("PeriodicallyRun(AddAllDirectories): %v", err)
 		}
-	})
-
-	go sequencer.PeriodicallyRun(ctx, time.Tick(*refresh), func(ctx context.Context) {
-		if err := signer.DefineRevisionsForAllMasterships(ctx, int32(*batchSize)); err != nil {
-			glog.Errorf("PeriodicallyRun(DefineRevisionsForAllMasterships): %v", err)
+		if err := signer.RunBatchForAllMasterships(ctx, int32(*batchSize)); err != nil {
+			glog.Errorf("PeriodicallyRun(RunBatchForAllMasterships): %v", err)
 		}
 	})
-	go sequencer.PeriodicallyRun(ctx, time.Tick(*refresh), func(ctx context.Context) {
-		if err := signer.ApplyRevisionsForAllMasterships(ctx); err != nil {
-			glog.Errorf("PeriodicallyRun(ApplyRevisionsForAllMasterships): %v", err)
-		}
-	})
-
-	go sequencer.PeriodicallyRun(ctx, time.Tick(*refresh), func(ctx context.Context) {
-		if err := signer.PublishLogForAllMasterships(ctx); err != nil {
-			glog.Errorf("PeriodicallyRun(PublishRevisionsForAllMasterships): %v", err)
-		}
-	})
-
-	<-ctx.Done() // Block until server exit.
 }
