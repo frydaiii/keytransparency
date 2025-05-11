@@ -162,6 +162,16 @@ Create or fetch the public key for your specific application.
   Revision |Timestamp                    |Profile
   4        |Mon Sep 12 22:23:54 UTC 2016 |keys:<key:"app1" value:"test" >
   ```
+  
+#### Check key expiration status
+  ```
+  keytransparency-client check-expiration user@domain.com --kt-url sandbox.keytransparency.dev:443
+  ✅ Key ID 12345678 is valid (expires in 180 days on 2025-11-07)
+  ⚠️ WARNING: Key ID 87654321 will expire in 15 days (on 2025-05-26)
+  
+  Please rotate any keys that are expired or will expire soon.
+  Use 'keytransparency-client authorized-keys create-keyset' to create new keys.
+  ```
 
 #### Checks
 - [Proof for foo@bar.com](https://sandbox.keytransparency.dev/v1/directories/default/users/foo@bar.com)
