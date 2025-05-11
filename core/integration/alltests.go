@@ -60,6 +60,8 @@ var AllTests = []NamedTestFn{
 	{Name: "TestBatchUpdate", Fn: TestBatchUpdate},
 	{Name: "TestBatchCreate", Fn: TestBatchCreate},
 	{Name: "TestBatchListUserRevisions", Fn: TestBatchListUserRevisions},
+	// Key Expiration Tests
+	{Name: "TestKeyExpirationChecker", Fn: TestKeyExpirationChecker},
 	// Monitor Tests
 	{Name: "TestMonitor", Fn: TestMonitor},
 }
